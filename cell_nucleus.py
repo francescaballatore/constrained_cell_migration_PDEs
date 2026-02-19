@@ -91,7 +91,7 @@ bendingStiffness_n = bendingStiffness_cell*10
 opre0_ce = 0.0
 opre0_n = 0.0
 # Results name
-results_name = "results/Actin/" 
+results_name = "../results/Actin/" 
 # Time scheme
 Ttot = 2.0
 dt = 1.0e-3 
@@ -268,10 +268,10 @@ SurfaceEnergyList = [assemble_scalar(form(cellGS.tensionStiffness * cellGS.dx))]
 BendingEnergyList = [assemble_scalar(form(cellGS.bendingStiffness/2 * cellGS.H_old**2 * cellGS.dx))]
 # }}}
 
-PlotMicrochannel(x_left, length, width, height, "results/Actin/vtk/barrier_plot.vtk")
+PlotMicrochannel(x_left, length, width, height, "../results/Actin/vtk/barrier_plot.vtk")
 #PlotCircles(bmCenters, bmDia, "results/Actin/vtk/barrier_plot.vtk")
      
-csv_filename = "results/Actin/Actin.csv"
+csv_filename = "../results/Actin/Actin.csv"
 data_written = False
 touch = False
 cell_touch = 0.0
@@ -351,7 +351,7 @@ while (round(t + dt, 9) <= Ttot):
             "BendingEnergy_ce" : np.array(BendingEnergyList),
         }
         data = pd.DataFrame(data)
-        data.to_csv("results/Actin/resu.csv")
+        data.to_csv("../results/Actin/resu.csv")
     if (not touch) and (np.min(cellGS.barrierForce.x.array) < -1):
             cell_touch = t
             touch = True 
