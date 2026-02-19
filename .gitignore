@@ -1,0 +1,13 @@
+# Ignora i risultati delle simulazioni (es: file .csv o .vtu)
+*.csv
+*.vtu
+*.mat
+*.npy
+
+# Ignora cartelle temporanee di sistema e Python
+__pycache__/
+.DS_Store
+.ipynb_checkpoints/
+
+# Ignora file di log pesanti
+*.log
