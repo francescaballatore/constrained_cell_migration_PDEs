@@ -10,9 +10,11 @@ from dolfinx.fem import Constant, Function, dirichletbc, Expression
 from dolfinx.io import XDMFFile, VTKFile
 from dolfinx.la import create_petsc_vector
 from scipy.spatial import cKDTree
+from scipy.ndimage import gaussian_filter1d
+
 
 import ufl
-from ufl import (TestFunctions, TrialFunction, Identity, grad, inner, det, div, dot, inv, tr, as_vector, outer, derivative, dev, sqrt, eq)
+from ufl import (TestFunctions, TrialFunction, Identity, grad, inner, det, div, dot, inv, tr, as_vector, outer, derivative, dev, sqrt, eq, max_value)
 
 import basix
 from basix.ufl import element, quadrature_element
@@ -83,9 +85,9 @@ class GSPDE(object):
         self.dimSpa = self.dimSur + 1
         # Data distribution
         self.imap = self.domain.geometry.index_map()
-        self.global_node_ids = self.imap.local_to_global(np.arange(self.domain.geometry.x.shape[0]))
+        self.global_node_ids = self.imap.local_to_global(np.arange(self.domain.geometry.x.shape[0], dtype=np.int32))        
         self.gather_global_node_ids = self.comm.allgather(self.global_node_ids)
-        local_node_ids = self.imap.global_to_local(np.arange(self.imap.size_global))
+        local_node_ids = np.arange(self.imap.size_local + self.imap.num_ghosts, dtype=np.int32)
         self.node_ids_arg = np.argwhere(local_node_ids >= 0).flatten()
         self.node_ids = local_node_ids[self.node_ids_arg]
         # Get number of nodes
@@ -102,7 +104,11 @@ class GSPDE(object):
         self.global_orderedNodeIds = OrderNodeList(connectivities[0, 0],
                                                    connectivities[0, 0],
                                                    connectivities, self.numEles)
-        local_orederedNodeIds = self.imap.global_to_local(self.global_orderedNodeIds)
+        all_local_indices = np.arange(self.imap.size_local + self.imap.num_ghosts, dtype=np.int32)
+        all_globals = self.imap.local_to_global(all_local_indices)
+        sort_idx = np.argsort(all_globals)
+        pos = np.searchsorted(all_globals[sort_idx], self.global_orderedNodeIds)
+        local_orederedNodeIds = all_local_indices[sort_idx[pos]]
         self.orderedNodeArg = np.argwhere(local_orederedNodeIds >= 0).flatten()
         self.orderedNodeIds = local_orederedNodeIds[self.orderedNodeArg]
         return
@@ -120,21 +126,27 @@ class GSPDE(object):
     # }}}
     # Set finite element spaces {{{
     def SetFESpaces(self):
-        meshOrder = self.kwargs["meshOrder"]
-        # Element types: quadratic scalar
-        ele_scalar = element("Lagrange", self.domain.basix_cell(), meshOrder)
-        self.V_scalar = fem.functionspace(self.domain, ele_scalar)
-        # Element types: quadratic vector
-        ele_u = element("Lagrange", self.domain.basix_cell(), meshOrder,
-                        shape = (self.dimSpa, ))
-        self.V_u = fem.functionspace(self.domain, ele_u)
-        # Element types: quadratic tensor
-        ele_T = element("Lagrange", self.domain.basix_cell(), meshOrder, shape=(self.dimSpa, self.dimSpa))
-        self.V_tensor = fem.functionspace(self.domain, ele_T)
-        # Mixed element
-        ele_mixed = basix.ufl.mixed_element([ele_u, ele_scalar])
-        self.V_mixed = fem.functionspace(self.domain, ele_mixed)
-        return
+            import ufl
+            import basix.ufl
+            meshOrder = self.kwargs["meshOrder"]
+            cell_type = self.domain.ufl_cell()
+
+            # Element types: scalar
+            ele_scalar = ufl.FiniteElement("Lagrange", cell_type, meshOrder)
+            self.V_scalar = fem.functionspace(self.domain, ele_scalar)
+
+            # Element types: vector
+            ele_u = ufl.VectorElement("Lagrange", cell_type, meshOrder, dim=self.dimSpa)
+            self.V_u = fem.functionspace(self.domain, ele_u)
+
+            # Element types: tensor
+            ele_T = ufl.TensorElement("Lagrange", cell_type, meshOrder, shape=(self.dimSpa, self.dimSpa))
+            self.V_tensor = fem.functionspace(self.domain, ele_T)
+
+            # Mixed element
+            ele_mixed = ufl.MixedElement([ele_u, ele_scalar])
+            self.V_mixed = fem.functionspace(self.domain, ele_mixed)
+            return
     # }}}
     # Set variables {{{
     def SetVariables(self):
@@ -143,13 +155,14 @@ class GSPDE(object):
         periRef = self.kwargs["periRef"]
         dt = self.kwargs["dt"]
         t = self.kwargs.get("t", 0.0)
-        opre0 = self.kwargs["opre0"]
-        gamma = self.kwargs.get("gamma", 0.0)
+        H_ref = self.kwargs["Href"]
+        peri_stiffness = self.kwargs["peri_stiffness"]
+        area_stiffness = self.kwargs["area_stiffness"]
+        peri_max_factor = self.kwargs["peri_max_factor"]
         width = self.kwargs["width"]
         length = self.kwargs["length"]
         height = self.kwargs["height"]
         x_left = self.kwargs["x_left"]
-        omega = self.kwargs["omega"]
         k_bar = self.kwargs["k_bar"]
         beta = self.kwargs["beta"]
         k_pr = self.kwargs["k_pr"]
@@ -158,8 +171,11 @@ class GSPDE(object):
         alpha = self.kwargs["alpha"] 
         k_rep = self.kwargs["k_rep"] 
         role = self.kwargs["role"]
-        tensionStiffness_init = self.kwargs["surfacetension"]
-        bendingStiffness_init = self.kwargs["bendingstiffness"] 
+        tensionStiffness_Ctrl = self.kwargs["surfacetension_Ctrl"]
+        tensionStiffness_KO = self.kwargs["surfacetension_KO"]
+        bendingStiffness_Ctrl = self.kwargs["bendingstiffness_Ctrl"]
+        bendingStiffness_KO = self.kwargs["bendingstiffness_KO"]
+        omega_value = self.kwargs["omega"]
         k_sr = self.kwargs["k_sr"]
         delta_d = self.kwargs["delta_d"]
         kappa_d  = self.kwargs["kappa_d"]
@@ -168,6 +184,8 @@ class GSPDE(object):
         if role == "nucleus":
             N_chem = self.kwargs["N_chem"]
             D_chem = self.kwargs["D_chem"]
+            init = self.kwargs["init"]
+            coseno = self.kwargs["coseno"]
         # Floats
         self.dt = dt
         self.aRef = aRef
@@ -175,12 +193,14 @@ class GSPDE(object):
         self.area = aRef
         self.Dia = Dia
         self.perimeter = periRef
-        self.gamma = gamma
+        self.Href = H_ref
+        self.peri_stiffness = peri_stiffness
+        self.area_stiffness = area_stiffness
+        self.peri_max_factor = peri_max_factor
         self.width = width
         self.length = length
         self.height = height
         self.x_left = x_left
-        self.omega = omega
         self.beta = beta
         self.k_bar = k_bar
         self.k_pr = k_pr
@@ -192,9 +212,11 @@ class GSPDE(object):
         self.x_front = Dia/2
         self.x_front_p = 1
         self.x_rear = -Dia/2
-        self.x_rear_p = 1
-        self.tensionStiffness_init = tensionStiffness_init
-        self.bendingStiffness_init = bendingStiffness_init
+        self.tensionStiffness_Ctrl = tensionStiffness_Ctrl
+        self.tensionStiffness_KO = tensionStiffness_KO
+        self.bendingStiffness_Ctrl = bendingStiffness_Ctrl
+        self.bendingStiffness_KO = bendingStiffness_KO
+        self.omega_value = omega_value
         self.k_sr = k_sr
         self.delta_d = delta_d
         self.kappa_d = kappa_d
@@ -203,10 +225,16 @@ class GSPDE(object):
         if self.role == "nucleus":
             self.N_chem = N_chem
             self.D_chem = D_chem
+            self.init = init
+            self.coseno = coseno
         # Constants
         self.dk = Constant(self.domain, PETSc.ScalarType(dt))
         self.t_constant = Constant(self.domain, PETSc.ScalarType(t))
-        self.opre = Constant(self.domain, PETSc.ScalarType(opre0))
+        self.opre_area = Constant(self.domain, PETSc.ScalarType(0.0))
+        self.opre_peri = Constant(self.domain, PETSc.ScalarType(0.0))
+        # Scalar functions
+        self.opre_total = Function(self.V_scalar)
+        self.smoothed_H = Function(self.V_scalar)
         # Main functions
         self.w = Function(self.V_mixed)
         self.u, self.H = ufl.split(self.w)
@@ -226,6 +254,7 @@ class GSPDE(object):
         self.H_old = Function(self.V_scalar)
         self.tensionStiffness = Function(self.V_scalar)
         self.bendingStiffness = Function(self.V_scalar)
+        self.omega = Constant(self.domain, PETSc.ScalarType(omega_value))
         self.selfRepuForce = Function(self.V_scalar)
         self.barrierForce = Function(self.V_scalar)
         self.movForce = Function(self.V_scalar)
@@ -239,23 +268,39 @@ class GSPDE(object):
         self.disp = Function(self.V_u)
         self.normal = Function(self.V_u)
         self.filoDir = Function(self.V_u)
+        # PDEs
+        self.a = 10.0
+        self.b = 50.0
+        self.c = 20.0
+        self.k1 = 40
+        self.k2 = 250
+        self.k3 = 50
+        self.k4 = 25
         return
     # }}}
     # Set expressions {{{
     def SetExpressions(self, **kwargs):
+        op = self.opre_peri
+        sigmoid = lambda x: 1.0 / (1.0 + ufl.exp(-x))
+        opre_H = sigmoid(-10.0 * op) * self.smoothed_H * op
+        opre_total_math = opre_H + self.opre_area
+
+        totalForce_math = (opre_total_math
+                        + self.barrierForce
+                        + self.selfRepuForce
+                        + self.movForce
+                        + self.elasticForce
+                        + self.repulsiveForce)
+
         self.normal_expr = Expression(self.n, self.V_u.element.interpolation_points())
         self.x_expr = Expression(self.w.sub(0), self.V_u.element.interpolation_points())
         self.H_expr = Expression(self.w.sub(1), self.V_scalar.element.interpolation_points())
+        self.disp_expr = Expression(self.x_old - self.x0, self.V_u.element.interpolation_points())
+        self.opre_expr = Expression(opre_total_math, self.V_scalar.element.interpolation_points())
+        self.totalForce_expr = Expression(totalForce_math, self.V_scalar.element.interpolation_points())
+        
         if self.role == "nucleus":
             self.a_chem_expr = [Expression(i, self.V_scalar.element.interpolation_points()) for i in self.a_chem]
-        self.disp_expr = Expression(self.x_old - self.x0, self.V_u.element.interpolation_points())
-        self.totalForce_expr = Expression(self.opre
-                                          + self.barrierForce
-                                          + self.selfRepuForce
-                                          + self.movForce
-                                          + self.elasticForce
-                                          + self.repulsiveForce,
-                                            self.V_scalar.element.interpolation_points())
         return
     # }}}
     # Set initialisation {{{
@@ -270,14 +315,15 @@ class GSPDE(object):
         InitialCurvature(self.H_old, self.normal, self.x_old, self.dx)
         # Initialisation of phi
         orderedPhi = np.linspace(0.0, 2.0*np.pi, self.global_orderedNodeIds.size)
+        orderedPhi = orderedPhi[::-1]
         self.phi.x.array[self.orderedNodeIds] = orderedPhi[self.orderedNodeArg]
         # Tension and bending stiffness
-        self.tensionStiffness.x.array[:] = self.tensionStiffness_init
-        self.bendingStiffness.x.array[:] = self.bendingStiffness_init
+        self.tensionStiffness.x.array[:] = self.tensionStiffness_Ctrl
+        self.bendingStiffness.x.array[:] = self.bendingStiffness_Ctrl
         # Chemical concentration
         if self.role == "nucleus":
-            self.a_chem_old[0].x.array[:] = 0.2
-            self.a_chem_old[1].x.array[:] = 0.2
+            self.a_chem_old[0].x.array[:] = self.init + self.coseno*0.2*np.cos(10*self.phi.x.array)
+            self.a_chem_old[1].x.array[:] = 0.2 + self.coseno*0.2*np.cos(10*self.phi.x.array)
             self.a_chem_old[2].x.array[:] = 0.0
     # }}}
     # Set weak form {{{
@@ -285,12 +331,12 @@ class GSPDE(object):
         #Href = self.kwargs["Href"]
         Mu = (self.omega/self.dk)*inner(inner(self.u - self.x_old, self.normal), self.H_test)*self.dx
         Su = self.bendingStiffness*inner(grad_Gamma(self.H,self.normal),grad_Gamma(self.H_test,self.normal))*self.dx
-        Hpow2 = self.H_old**2.0
-        #Hpow2 = Href**2.0 - self.H**2.0
+        #Hpow2 = self.H_old**2.0
+        Hpow2 = self.H**2 - self.Href**2.0
         Qu = -0.5*self.bendingStiffness*inner(Hpow2*self.H, self.H_test)*self.dx
         Tu = inner(self.tensionStiffness*self.H, self.H_test)*self.dx
         Fu = inner(self.totalForce, self.H_test)*self.dx
-        Res_u = Mu + Su + Qu - Fu + Tu # V = -div(H) - 0.5 H^3
+        Res_u = Mu + Su + Qu - Fu + Tu
         MH = inner(self.H*self.normal, self.u_test)*self.dx
         SH = inner(grad_Gamma(self.u,self.normal), grad_Gamma(self.u_test,self.normal))*self.dx
         Res_H = MH - SH # H = div(x)
@@ -300,18 +346,9 @@ class GSPDE(object):
         return
     def SetWeakFormChem(self, **kwargs):
         if self.role == "nucleus":
-            a = 10.0
-            b = 50.0
-            c = 20.0
-            k1 = 40
-            k2 = 250
-            k3 = 50
-            k4 = 25
-            Emax = 1.0
-            Umax = 1.0
-            fa = [k1*self.a_chem_old[0]*(1-self.a_chem_old[0]/Emax) - a*self.a_chem_old[0],  
-                  k2*self.a_chem_old[1]*(1-self.a_chem_old[1]/Umax) - k3*self.a_chem_old[0] - b*self.a_chem_old[1], 
-                  k4*self.a_chem_old[1] - c*self.a_chem_old[2]]
+            fa = [self.k1*self.a_chem_old[0]*(1-self.a_chem_old[0]) - self.a*self.a_chem_old[0],  
+                  self.k2*self.a_chem_old[1]*(1-self.a_chem_old[1]) - self.k3*self.a_chem_old[0] - self.b*self.a_chem_old[1], 
+                  self.k4*self.a_chem_old[1] - self.c*self.a_chem_old[2]]
             if self.role == "nucleus":
                 for i in range(self.N_chem):
                     Lu = (1.0/self.dk)*inner(self.a_chem[i], self.a_chem_test[i])*self.dx + self.D_chem[i] * inner(grad_Gamma(self.a_chem[i], self.normal),grad_Gamma(self.a_chem_test[i], self.normal)) * self.dx
@@ -331,8 +368,10 @@ class GSPDE(object):
             for i in range(self.N_chem):
                 self.a_chem_old[i].interpolate(self.a_chem_expr[i])
             # Update bending stiffness and surface tension based on a_chem[2]
-            self.bendingStiffness.interpolate(fem.Expression(ComputeBendingStiffness(self.a_chem[2], self.bendingStiffness_init), self.V_scalar.element.interpolation_points()))
-            self.tensionStiffness.interpolate(fem.Expression(ComputeTensionStiffness(self.a_chem[2], self.tensionStiffness_init), self.V_scalar.element.interpolation_points()))
+            self.bendingStiffness.interpolate(fem.Expression(ComputeBendingStiffness(self.a_chem_old[2], self.bendingStiffness_Ctrl, self.bendingStiffness_KO, self.a, self.b, self.c, self.k1, self.k2, self.k3, self.k4), self.V_scalar.element.interpolation_points()))
+            self.tensionStiffness.interpolate(fem.Expression(ComputeTensionStiffness(self.a_chem_old[2], self.tensionStiffness_Ctrl, self.tensionStiffness_KO, self.a, self.b, self.c, self.k1, self.k2, self.k3, self.k4), self.V_scalar.element.interpolation_points()))
+            self.omega.value = PETSc.ScalarType(max(self.omega_value * self.a_chem_old[2].x.array.mean(), self.omega_value/2))
+            print(self.omega.value)
         # Update mesh
         uMat = FromVectorToMatrix(self.x_old.x.array, self.dimSpa)
         self.domain.geometry.x[:, :self.dimSpa] = uMat
@@ -368,13 +407,13 @@ class GSPDE(object):
         self.x_front = np.max(x_coords)
         self.x_front_p = np.argmax(x_coords)
         self.x_rear = np.min(x_coords)
-        self.x_rear_p = np.argmin(x_coords)
         return
     # }}}
     # Update loads {{{
     def UpdateLoads(self):
         # Osmotic pressure
         self.OsmoticPressure()
+        self.opre_total.interpolate(self.opre_expr)
         # Self-repulsive force
         self.SelfRepulsiveForce()
         # Barrier force
@@ -392,22 +431,17 @@ class GSPDE(object):
 
     # Osmotic pressure {{{
     def OsmoticPressure(self):
-        typeOpressure = self.kwargs.get("typeOpressure", "area")
-        if typeOpressure == "area":
-            UpdateOpressure(self.opre, self.area, self.aRef, self.dt)
-        elif typeOpressure == "perimeter":
-            UpdateOpressure(self.opre, self.perimeter, self.periRef, self.dt)
-        # elif typeOpressure == "both":
-        #     periFactor = self.kwargs.get("periFactor", 2.0)
-        #     UpdateOpressure_area_perimeter(self.opre, self.area, self.aRef,
-        #                                    self.perimeter, self.periRef*periFactor,
-        #                                    self.dt, self.alpha, self.beta, self.gamma)
-        elif typeOpressure == "none":
-            self.opre.value = 0.0
-        else:
-            message = "Invalid type of osmotic pressure. Use: 'area', 'perimeter' or 'none'"
-            raise TypeError(message)
+        self.SmoothCurvature()
+        area_stiffness = self.area_stiffness
+        peri_stiffness = self.peri_stiffness
+        max_peri = self.peri_max_factor*self.periRef
+        # lambda_peri = (-1.0 - peri_stiffness*(gspde.perimeter - gspde.periRef))
+        lambda_peri = peri_stiffness*(max_peri - self.perimeter)
+        lambda_area = area_stiffness*(self.aRef - self.area)
+        self.opre_peri.value = lambda_peri
+        self.opre_area.value = lambda_area
         return
+    # }}}
     
     # Self-repulsive force {{{
     def SelfRepulsiveForce(self):
@@ -565,39 +599,36 @@ class GSPDE(object):
             x_c = compute_center(self.other_gspde.domain)
             delta = x_c - x_n
             delta = ufl.as_vector(delta[:2].tolist())
-            norm_delta = ufl.sqrt(ufl.dot(delta, delta)) + 1e-8  # evita divisione per zero
-            delta_normalized = (delta / norm_delta)
-            #delta_normalized = ufl.as_vector([1.0, 0.0])
-            projection = ufl.dot(delta_normalized, self.normal) 
+            #norm_delta = ufl.sqrt(ufl.dot(delta, delta)) + 1e-8  # evita divisione per zero
+            #delta_normalized = (delta / norm_delta)
+            #projection = ufl.dot(delta_normalized, self.normal) 
+            projection = ufl.dot(delta, self.normal)
 
-            H_at_front = self.H_old.x.array[self.x_front_p]
-            H_at_rear = self.H_old.x.array[self.x_rear_p]
+            #H_at_front = self.H_old.x.array[self.x_front_p]
+            #H_at_rear = self.H_old.x.array[self.x_rear_p]
 
-            if np.isclose(H_at_front, H_at_rear, atol=2e-2): 
-                 coeff = self.k_el
-            else:
-                 coeff = self.k_el
-
-            f_int = coeff * projection
+            f_int = self.k_el * projection
+            #f_int = projection
         else:
             x_c = compute_center(self.domain)
             x_n = compute_center(self.other_gspde.domain)
             delta = x_c - x_n
             delta = ufl.as_vector(delta[:2].tolist())
-            norm_delta = ufl.sqrt(ufl.dot(delta, delta)) + 1e-8  # evita divisione per zero
-            delta_normalized = (delta / norm_delta)
-            #delta_normalized = ufl.as_vector([1.0, 0.0])
-            projection = ufl.dot(delta_normalized, self.normal) 
+            #norm_delta = ufl.sqrt(ufl.dot(delta, delta)) + 1e-8  # evita divisione per zero
+            #delta_normalized = (delta / norm_delta)
+            #projection = ufl.dot(delta_normalized, self.normal) 
+            projection = ufl.dot(delta, self.normal) 
 
-            H_at_front = self.other_gspde.H_old.x.array[self.other_gspde.x_front_p]
-            H_at_rear = self.other_gspde.H_old.x.array[self.other_gspde.x_rear_p]
+            #H_at_front = self.other_gspde.H_old.x.array[self.other_gspde.x_front_p]
+            #H_at_rear = self.other_gspde.H_old.x.array[self.other_gspde.x_rear_p]
 
-            if np.isclose(H_at_front, H_at_rear, atol=2e-2): 
-                 coeff = self.k_el
-            else:
-                 coeff = self.k_el*self.factor
+            #if np.isclose(H_at_front, H_at_rear, atol=3e-2): 
+            #     coeff = self.k_el
+            #else:
+            #     coeff = self.k_el*self.factor
 
-            f_int = - coeff * projection
+            #f_int = - coeff * projection
+            f_int = - self.k_el * projection
 
         V_n = self.elasticForce.function_space
         q_n = ufl.TestFunction(V_n)
@@ -654,6 +685,15 @@ class GSPDE(object):
             global_array[self.gather_global_node_ids[k1]] = gather_array[k1]
         return global_array
     # }}}
+    def SmoothCurvature(self):
+        # Smoothing parameters
+        window_length = 5  # Must be odd
+        polyorder = 2       # Order of polynomial
+        orderedArray = self.H_old.x.array[self.orderedNodeIds]
+        # smoothed_array = savgol_filter(orderedArray, window_length, polyorder)
+        smoothed_array = gaussian_filter1d(orderedArray, 10)
+        self.smoothed_H.x.array[self.orderedNodeIds] = smoothed_array
+        return
 # }}}
 
 # Solve iteration {{{
@@ -679,16 +719,24 @@ def SolveIteration(t, gspdes):
     return
 # }}}
 
-def ComputeBendingStiffness(a_chem_2, bendingStiffness_init):
+
+
+def ComputeBendingStiffness(a_chem_2, bendingStiffness_Ctrl, bendingStiffness_KO, a, b, c, k1, k2, k3, k4):
     """
     Compute bending stiffness as a function of a_chem[2].
-    Modify this function to define the desired non-linear relationship.
     """
-    return bendingStiffness_init*a_chem_2**2
+    W2 = k4*(k2-b)/(c*k2)
+    delta = (k2-b)**2-4*k2*k3/k1*(k1-a)
+    U4 = ((k2-b)+sqrt(delta))/(2*k2)
+    W4 = k4*U4/c
+    return max_value(0.0, (bendingStiffness_KO-bendingStiffness_Ctrl)/(W2-W4)*(a_chem_2-W4))+bendingStiffness_Ctrl
 
-def ComputeTensionStiffness(a_chem_2, tensionStiffness_init):
+def ComputeTensionStiffness(a_chem_2, tensionStiffness_Ctrl, tensionStiffness_KO, a, b, c, k1, k2, k3, k4):
     """
     Compute tension stiffness as a function of a_chem[2].
-    Modify this function to define the desired non-linear relationship.
     """
-    return tensionStiffness_init*a_chem_2**2
+    W2 = k4*(k2-b)/(c*k2)
+    delta = (k2-b)**2-4*k2*k3/k1*(k1-a)
+    U4 = ((k2-b)+sqrt(delta))/(2*k2)
+    W4 = k4*U4/c
+    return max_value(0.0, (tensionStiffness_KO-tensionStiffness_Ctrl)/(W2-W4)*(a_chem_2-W4))+tensionStiffness_Ctrl

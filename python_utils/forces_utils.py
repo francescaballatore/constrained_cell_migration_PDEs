@@ -129,6 +129,19 @@ def UpdateOpressure(opre, A, Aref, dt):
     newPressure = (oldPressure + dt*Kp*(Aref - A)/Aref)/(1.0 + Ki*dt)
     opre.value = newPressure
     return
+def UpdateOpressure_area_perimeter(opre, A, Aref, P, Pref, dt, alpha,
+                                   beta, gamma, facMax = 0.99, facRef = 1.1):
+    """
+    - Perimeter base function: P**n/(P**n + Pref**n)
+        - conditions: facMax = (facRef*Pref)**n/((facRef*Pref)**n + Pref**n)
+    """
+    n = np.log(facMax/(1.0 - facMax))/np.log(facRef)
+    oldPressure = opre.value
+    alpha_of_area = alpha*(Aref**2.0 - A**2.0)/(A**2.0 + Aref**2.0)
+    gamma_of_peri = gamma*P**n/(P**n + Pref**n)
+    newPressure = (oldPressure + dt*(alpha_of_area - gamma_of_peri))/(1.0 + beta*dt)
+    opre.value = newPressure
+    return
 # }}}
 # Cell-basement membrane contact force {{{
 def CellBmContactForce(xCell, xBm, dis_mag, dis_st, dis_tol,
