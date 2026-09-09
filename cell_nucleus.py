@@ -71,9 +71,27 @@ np.random.seed(16)
 # }}}
 
 # Parameters {{{
+# Input data from experiments
+label = 'KO' # 'Ctrl', 'Ctrl_cos', 'KO', 'KO_cos'
+if label == 'Ctrl':
+    cellDia = 19.4
+    init = 0.2
+    coseno = 0.0
+elif label == 'Ctrl_cos':
+    cellDia = 19.4
+    init = 0.2
+    coseno = 1.0
+elif label == 'KO':
+    cellDia = 21.76
+    init = 0.0
+    coseno = 0.0
+elif label == 'KO_cos': 
+    cellDia = 21.76 
+    init = 0.0
+    coseno = 1.0
+
 # Geometry-mesh
-nucleusDia = 10.0
-cellDia = 20.0
+nucleusDia = cellDia/2.0
 lc_ce = 5.0e-2
 lc_n = 5.0e-2
 meshOrder = 2
@@ -82,22 +100,29 @@ Aref_ce = (cellDia/2.0)**2.0*np.pi
 periRef_ce = (cellDia/2.0)*2.0*np.pi
 Aref_n = (nucleusDia/2.0)**2.0*np.pi
 periRef_n = (nucleusDia/2.0)*2.0*np.pi
+#Viscous force
+omega_cell = 0.5
 # Membrane tension is given here in nN/µm and bending stiffness in 10^-15 J
-tensionStiffness_cell = 1.0
-bendingStiffness_cell = 1.0e-3
-tensionStiffness_n = tensionStiffness_cell*10
-bendingStiffness_n = bendingStiffness_cell*10
+tensionStiffness_nucleus_Ctrl = 0.16025
+tensionStiffness_nucleus_KO = 0.21346
+bendingStiffness_cell_Ctrl = 1.0e-4
+bendingStiffness_cell_KO = 1.0e-3
 # Initial conditions
 opre0_ce = 0.0
 opre0_n = 0.0
 # Results name
-results_name = "../results/Actin/" 
+results_name = "results/" 
 # Time scheme
-Ttot = 2.0
-dt = 1.0e-3 
-print_each = 1
-#Viscous force
-omega = 1e-1 
+Ttot = 5.0
+dt = 2.5e-3 
+print_each = 4
+# Osmotic pressure
+peri_stiffness_cell = 1.0e-1
+area_stiffness_cell = 1.0e0
+peri_stiffness_nucl = 1.0e-1
+area_stiffness_nucl = 1.0e0
+peri_max_factor_cell = 1.0
+peri_max_factor_nucl = 1.0
 # Repulsive force
 k_sr = 1.0e0
 delta_d = 1.0e-1
@@ -110,19 +135,19 @@ k_pr = 16
 length = 100
 height = 20
 width = 6
-x_left = 20.0
+x_left = 40.0
 # Barrier force
-k_bar = 20.0
-beta = 3.5
+k_bar = 8.0
+beta = 5.0
 # Elastic force
-k_el = 6.0
-factor = 2
+k_el = 2.0 #8.0
+factor = 2.5
 # Repulsive force
+k_rep = 18.0 #12.0
 alpha = 5.0
-k_rep = 12.0
 # PDEs chemical 
 N_chem = 3  # number of species
-D_chem = [1.0, 0.1, 1.0]
+D_chem = [0.1, 0.1, 0.1]
 # }}}
 
 # Solver
@@ -132,7 +157,7 @@ def SetSolverOpt(solver):
     solver.convergence_criterion = "incremental"
     solver.rtol = 1.0e-8
     solver.atol = 1.0e-8
-    solver.max_it = 25
+    solver.max_it = 1000
     solver.report = True
     solver.relaxation_parameter = 1.0
     # Krylov solver
@@ -186,6 +211,9 @@ cell_params = {
         "aRef" : Aref_ce,
         "periRef" : periRef_ce,
         "Href" : 2.0/cellDia,
+        "peri_stiffness" : peri_stiffness_cell,
+        "area_stiffness" : area_stiffness_cell,
+        "peri_max_factor" : peri_max_factor_cell,
         "k_sr" : k_sr,
         "delta_d" : delta_d,
         "kappa_d" : kappa_d,
@@ -196,16 +224,18 @@ cell_params = {
         "width" : width,
         "x_left" : x_left,
         "beta" : beta, 
-        "omega" : omega, 
+        "omega" : omega_cell, 
         "k_bar" : k_bar, 
         "k_pr" : k_pr, 
         "k_el" : k_el,
         "factor" : factor,
         "alpha" : alpha,
         "k_rep" : k_rep,
-        "surfacetension" : tensionStiffness_cell,
-        "bendingstiffness" : bendingStiffness_cell,
-        "typeOpressure" : "area",
+        "surfacetension_Ctrl" : tensionStiffness_nucleus_Ctrl/10,
+        "surfacetension_KO" : tensionStiffness_nucleus_KO/10,
+        "bendingstiffness_Ctrl" : bendingStiffness_cell_Ctrl,
+        "bendingstiffness_KO" : bendingStiffness_cell_KO,
+        "typeOpressure" : "both",
         "equidistribute" : True,
         "role" : "cell",
         }
@@ -221,14 +251,22 @@ n_params["periRef"] = periRef_n
 n_params["Dia"] = nucleusDia
 n_params["Href"] = 2.0/nucleusDia
 n_params["opre0"] = opre0_n
+n_params["peri_stiffness"] = peri_stiffness_nucl
+n_params["area_stiffness"] = area_stiffness_nucl
+n_params["peri_max_factor"] = peri_max_factor_nucl
 n_params["k_pr"] = 1e-8
-n_params["typeOpressure"] = "area"
+n_params["k_bar"] = 1e-8
+n_params["typeOpressure"] = "both"
 n_params["equidistribute"] = True
 n_params["role"] = "nucleus"
-n_params["surfacetension"] = tensionStiffness_n
-n_params["bendingstiffness"] = bendingStiffness_n   
+n_params["surfacetension_Ctrl"] = tensionStiffness_nucleus_Ctrl
+n_params["surfacetension_KO"] = tensionStiffness_nucleus_KO
+n_params["bendingstiffness_Ctrl"] = bendingStiffness_cell_Ctrl*10
+n_params["bendingstiffness_KO"] = bendingStiffness_cell_KO*10
 n_params["N_chem"] = N_chem
 n_params["D_chem"] = D_chem
+n_params["init"] = init
+n_params["coseno"] = coseno
 
 nGS = GSPDE(other_gspde=cellGS, **n_params)
 cellGS.other_gspde = nGS
@@ -240,26 +278,31 @@ areaList_ce = [cellGS.area]
 periList_ce = [cellGS.perimeter]
 velocityList_ce = [0.0]
 stressList_ce = [0.0]
+mean_tensionStiffness = (fem.assemble_scalar(fem.form(nGS.tensionStiffness * nGS.dx ))/ nGS.perimeter)
+mean_tensionStiffnessList = [mean_tensionStiffness]
+mean_bendingStiffness = (fem.assemble_scalar(fem.form(nGS.bendingStiffness * nGS.dx))/ nGS.perimeter)
+mean_bendingStiffnessList = [mean_bendingStiffness]
+omegaList = [float(nGS.omega.value)]
 x_front = [cellDia/2]
 x_rear = -cellDia/2
 # Plasma membrane
 functions_list = [cellGS.disp, cellGS.H_old, cellGS.normal,
                   cellGS.selfRepuForce, cellGS.barrierForce,
                   cellGS.movForce, cellGS.repulsiveForce, cellGS.elasticForce,
-                  cellGS.phi, cellGS.bendingStiffness, cellGS.tensionStiffness]
+                  cellGS.phi, cellGS.bendingStiffness, cellGS.tensionStiffness, cellGS.opre_total]
 
 names_list = ["u", "H", "n", "Fsr", "Fbar", "Fpr", "Frep", "Fel",
-              "phi", "Fb", "Fs"]
+              "phi", "Fb", "Fs", "opre_total"]
 
-out_ce = Output(cellGS.domain, functions_list, names_list, "/Actin/resu_ce", comm)
+out_ce = Output(cellGS.domain, functions_list, names_list, "/resu_ce", comm)
 # Nuclear envelope
 functions_list = [nGS.disp, nGS.H_old, nGS.normal,
                   nGS.selfRepuForce, nGS.barrierForce,
                   nGS.elasticForce, nGS.repulsiveForce, nGS.phi,
-                  nGS.bendingStiffness, nGS.tensionStiffness] + nGS.a_chem
+                  nGS.bendingStiffness, nGS.tensionStiffness, nGS.opre_total] + nGS.a_chem
 names_list = ["u", "H", "n", "Fsr", "Fbar", "Fel", "Frep",
-              "phi", "Fb", "Fs"] + [f"a_chem_{i}" for i in range(len(nGS.a_chem))]
-out_n = Output(nGS.domain, functions_list, names_list, "/Actin/resu_n", comm)
+              "phi", "Fb", "Fs", "opre_total"] + [f"a_chem_{i}" for i in range(len(nGS.a_chem))]
+out_n = Output(nGS.domain, functions_list, names_list, "/resu_n", comm)
 
 areaList_n = [nGS.area]
 periList_n = [nGS.perimeter]
@@ -268,10 +311,9 @@ SurfaceEnergyList = [assemble_scalar(form(cellGS.tensionStiffness * cellGS.dx))]
 BendingEnergyList = [assemble_scalar(form(cellGS.bendingStiffness/2 * cellGS.H_old**2 * cellGS.dx))]
 # }}}
 
-PlotMicrochannel(x_left, length, width, height, "../results/Actin/vtk/barrier_plot.vtk")
-#PlotCircles(bmCenters, bmDia, "results/Actin/vtk/barrier_plot.vtk")
+PlotMicrochannel(x_left, length, width, height, "results/vtk/barrier_plot.vtk")
      
-csv_filename = "../results/Actin/Actin.csv"
+csv_filename = "results/Measures.csv"
 data_written = False
 touch = False
 cell_touch = 0.0
@@ -320,6 +362,12 @@ while (round(t + dt, 9) <= Ttot):
     surface_energy_form = form(cellGS.tensionStiffness * cellGS.dx) 
     surface_energy = assemble_scalar(surface_energy_form)
     SurfaceEnergyList.append(surface_energy)
+    # Save nuclear parameters
+    mean_tensionStiffness = (fem.assemble_scalar(fem.form(nGS.tensionStiffness * nGS.dx ))/ nGS.perimeter)
+    mean_tensionStiffnessList.append(mean_tensionStiffness)
+    mean_bendingStiffness = (fem.assemble_scalar(fem.form(nGS.bendingStiffness * nGS.dx))/ nGS.perimeter)
+    mean_bendingStiffnessList.append(mean_bendingStiffness)
+    omegaList.append(float(nGS.omega.value))
     # Save bending energy
     bending_energy_form = form(cellGS.bendingStiffness/2 * cellGS.H_old**2 * cellGS.dx) 
     bending_energy = assemble_scalar(bending_energy_form)
@@ -349,9 +397,12 @@ while (round(t + dt, 9) <= Ttot):
             "x_front" : np.array(x_front),
             "SurfaceEnergy_ce" : np.array(SurfaceEnergyList),
             "BendingEnergy_ce" : np.array(BendingEnergyList),
+            "MeanTensionStiffness_n" : np.array(mean_tensionStiffnessList),
+            "MeanBendingStiffness_n" : np.array(mean_bendingStiffnessList),
+            "Omega_n" : np.array(omegaList),
         }
         data = pd.DataFrame(data)
-        data.to_csv("../results/Actin/resu.csv")
+        data.to_csv("results/resu.csv")
     if (not touch) and (np.min(cellGS.barrierForce.x.array) < -1):
             cell_touch = t
             touch = True 
@@ -359,7 +410,7 @@ while (round(t + dt, 9) <= Ttot):
         with open(csv_filename, mode="w", newline="") as file:
             writer = csv.writer(file)
             writer.writerow(["Entry time", "Cell diameter", "Surface tension"])
-            writer.writerow([round(t-cell_touch,3), cellDia, tensionStiffness_cell])
+            writer.writerow([round(t-cell_touch,3), cellDia, nGS.tensionStiffness.x.array])
 
         data_written = True   
     
